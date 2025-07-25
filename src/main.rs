@@ -2,13 +2,12 @@
 
 use nalgebra::{Cholesky, Matrix2, Matrix4, SMatrix, Vector2, Vector4};
 use rand::Rng;
-use rand::rngs::ThreadRng;
 
 // --------------------------------------------------------------------------------
 // --- 共通の関数とモデル ---
 // --------------------------------------------------------------------------------
 
-/// 状態遷移関数 f(x)
+/// 状態遷移関数 f(x) (非線形)
 fn state_transition_function(x_prev: &Vector4<f64>, dt: f64) -> Vector4<f64> {
     let x = x_prev[0];
     let y = x_prev[1];
@@ -17,7 +16,7 @@ fn state_transition_function(x_prev: &Vector4<f64>, dt: f64) -> Vector4<f64> {
     Vector4::new(x + v * theta.cos() * dt, y + v * theta.sin() * dt, v, theta)
 }
 
-/// 観測関数 h(x)
+/// 観測関数 h(x) (線形)
 fn observation_function(x_curr: &Vector4<f64>) -> Vector2<f64> {
     let x = x_curr[0];
     let y = x_curr[1];
@@ -25,8 +24,93 @@ fn observation_function(x_curr: &Vector4<f64>) -> Vector2<f64> {
 }
 
 // --------------------------------------------------------------------------------
+// --- 違いが見えるように: 基本のカルマンフィルタ(KF)の実装 ---
+// --------------------------------------------------------------------------------
+// NOTE: 状態予測を「行列F * 状態x」という線形計算に変更。
+//       非線形なシステムに対してこの計算を行うため、EKFとは異なる（そして通常は劣る）結果となる。
+struct KalmanFilter {
+    x: Vector4<f64>,
+    p: Matrix4<f64>,
+    q: Matrix4<f64>,
+    r: Matrix2<f64>,
+    dt: f64,
+}
+
+impl KalmanFilter {
+    pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
+        let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
+        let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
+        KalmanFilter {
+            x: initial_x,
+            p: initial_p,
+            q,
+            r,
+            dt,
+        }
+    }
+
+    /// 状態遷移行列 F (ヤコビアンで線形化)
+    fn calculate_state_transition_matrix(&self, x_prev: &Vector4<f64>) -> Matrix4<f64> {
+        let v = x_prev[2];
+        let theta = x_prev[3];
+        let dt = self.dt;
+        Matrix4::new(
+            1.0,
+            0.0,
+            dt * theta.cos(),
+            -v * dt * theta.sin(),
+            0.0,
+            1.0,
+            dt * theta.sin(),
+            v * dt * theta.cos(),
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+    }
+
+    /// 観測行列 H
+    fn get_observation_matrix(&self) -> SMatrix<f64, 2, 4> {
+        SMatrix::<f64, 2, 4>::new(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    }
+
+    pub fn predict(&mut self) {
+        let f = self.calculate_state_transition_matrix(&self.x);
+
+        // ★★★ 変更点 ★★★
+        // 状態予測を線形モデル（行列乗算）で行う。
+        // これがEKFとの決定的な違いを生む。
+        self.x = f * self.x;
+
+        // 共分散の予測
+        self.p = f * self.p * f.transpose() + self.q;
+    }
+
+    pub fn update(&mut self, z: Vector2<f64>) {
+        let h = self.get_observation_matrix();
+        let y = z - h * self.x; // 観測も線形計算
+        let s = h * self.p * h.transpose() + self.r;
+        let s_inv = s.try_inverse().expect("KF: S行列が逆行列を持たない");
+        let k = self.p * h.transpose() * s_inv;
+        self.x += k * y;
+        self.p = (Matrix4::identity() - k * h) * self.p;
+    }
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
+    }
+}
+
+// --------------------------------------------------------------------------------
 // --- 拡張カルマンフィルタ(EKF)の実装 ---
 // --------------------------------------------------------------------------------
+// NOTE: 状態予測には非線形関数を直接使い、共分散予測に線形化を用いる。
+//       これによりKFよりも高い精度を実現する。
 struct ExtendedKalmanFilter {
     x: Vector4<f64>,
     p: Matrix4<f64>,
@@ -78,7 +162,11 @@ impl ExtendedKalmanFilter {
 
     pub fn predict(&mut self) {
         let f_jacobian = self.calculate_jacobian_f(&self.x);
+
+        // EKFは状態予測に「真の非線形関数」を使う
         self.x = state_transition_function(&self.x, self.dt);
+
+        // 共分散予測に線形化した行列を使う
         self.p = f_jacobian * self.p * f_jacobian.transpose() + self.q;
     }
 
@@ -253,10 +341,7 @@ impl CubatureKalmanFilter {
             );
         }
 
-        // 予測状態の計算
         self.x = propagated_points.column_mean();
-
-        // 予測共分散の計算
         let mut p_pred = Matrix4::zeros();
         for i in 0..(2 * self.n) {
             let diff = propagated_points.column(i) - self.x;
@@ -273,7 +358,6 @@ impl CubatureKalmanFilter {
         }
 
         let z_pred: Vector2<f64> = observed_points.column_mean();
-
         let mut p_zz = Matrix2::zeros();
         let mut p_xz = SMatrix::<f64, 4, 2>::zeros();
         for i in 0..(2 * self.n) {
@@ -300,28 +384,31 @@ impl CubatureKalmanFilter {
 // --- メインのシミュレーション ---
 // --------------------------------------------------------------------------------
 fn main() {
-    let mut rng: ThreadRng = rand::rng();
+    let mut rng = rand::rng();
     let dt = 0.1;
 
     let initial_x = Vector4::new(0.0, 0.0, 1.0, 0.0);
     let initial_p = Matrix4::from_diagonal(&Vector4::new(100.0, 100.0, 10.0, 10.0));
 
     // --- 4つのフィルタをインスタンス化 ---
+    let mut kf = KalmanFilter::new(initial_x, initial_p, dt);
     let mut ekf = ExtendedKalmanFilter::new(initial_x, initial_p, dt);
     let mut ukf = UnscentedKalmanFilter::new(initial_x, initial_p, dt);
     let mut ckf = CubatureKalmanFilter::new(initial_x, initial_p, dt);
 
-    println!("EKF, UKF, CKF 比較シミュレーションを開始します。");
-    println!("{:-<180}", "");
+    println!("KF, EKF, UKF, CKF 比較シミュレーションを開始します。");
+    println!("{:-<250}", "");
     println!(
-        "{:<10} | {:<40} | {:<25} | {:<40} | {:<40}",
-        "ステップ", "真の状態", "観測値", "EKF 推定値", "UKF 推定値"
+        "{:<6} | {:<36} | {:<22} | {:<36} | {:<38} | {:<33} | {:<40}",
+        "ステップ",
+        "真の状態",
+        "観測値",
+        "線形近似 KF",
+        "拡張 KF (EKF)",
+        "アンセンテッド KF (UKF)",
+        "キューバチャー KF (CKF)",
     );
-    println!(
-        "{:<10} | {:<40} | {:<25} | {:<40} |",
-        "", "", "", "CKF 推定値"
-    );
-    println!("{:-<180}", "");
+    println!("{:-<250}", "");
 
     // シミュレーションループ
     for i in 0..100 {
@@ -343,6 +430,9 @@ fn main() {
         );
 
         // --- 各フィルタの予測と更新 ---
+        kf.predict();
+        kf.update(observation);
+
         ekf.predict();
         ekf.update(observation);
 
@@ -366,15 +456,14 @@ fn main() {
                     s[0], s[1], s[2], s[3]
                 )
             };
+            let kf_str = format_state(kf.get_state());
             let ekf_str = format_state(ekf.get_state());
             let ukf_str = format_state(ukf.get_state());
             let ckf_str = format_state(ckf.get_state());
 
             println!(
-                "Step {i:<5} | {true_str:<40} | {obs_str:<25} | {ekf_str:<40} | {ukf_str:<40}",
+                "Step {i:<5} | {true_str:<40} | {obs_str:<25} | {kf_str:<40} | {ekf_str:<40} | {ukf_str:<40} | {ckf_str:<40}",
             );
-            println!("{:<10} | {:<40} | {:<25} | {:<40} |", "", "", "", ckf_str);
-            println!("{:-<180}", "");
         }
     }
     println!("\nシミュレーション終了。");
