@@ -477,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- グラフ描画 ---
     let root_area =
-        BitMapBackend::new("rust_plotters_comparison.png", (1024, 768)).into_drawing_area();
+        SVGBackend::new("rust_plotters_comparison.svg", (1024, 768)).into_drawing_area();
     root_area.fill(&WHITE)?;
 
     let mut chart = ChartBuilder::on(&root_area)
@@ -531,7 +531,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .draw()?;
 
     root_area.present()?;
-    println!("Graph saved to rust_plotters_comparison.png");
+    println!("Graph saved to rust_plotters_comparison.svg");
 
     Ok(())
 }
