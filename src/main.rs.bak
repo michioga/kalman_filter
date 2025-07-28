@@ -1,16 +1,14 @@
 // main.rs
-
 use nalgebra::{Cholesky, Matrix2, Matrix4, SMatrix, Vector2, Vector4};
-use plotters::prelude::full_palette::GREY;
-use plotters::prelude::full_palette::ORANGE;
-use plotters::prelude::full_palette::PURPLE;
 use plotters::prelude::*;
-use plotters::style::Color;
-use rand::prelude::*;
+use rand::Rng;
 
 // --------------------------------------------------------------------------------
-// --- 共通の関数とモデル (変更なし) ---
+// --- 共通の関数とモデル ---
 // --------------------------------------------------------------------------------
+
+/// 状態遷移関数 f(x) (非線形)
+/// 一定速度・一定角速度で動くモデル (Coordinated Turn Model)
 fn state_transition_function(x_prev: &Vector4<f64>, dt: f64) -> Vector4<f64> {
     let x = x_prev[0];
     let y = x_prev[1];
@@ -19,14 +17,19 @@ fn state_transition_function(x_prev: &Vector4<f64>, dt: f64) -> Vector4<f64> {
     Vector4::new(x + v * theta.cos() * dt, y + v * theta.sin() * dt, v, theta)
 }
 
+/// 観測関数 h(x) (線形)
+/// 状態のうち、位置(x, y)のみを観測する
 fn observation_function(x_curr: &Vector4<f64>) -> Vector2<f64> {
-    Vector2::new(x_curr[0], x_curr[1])
+    let x = x_curr[0];
+    let y = x_curr[1];
+    Vector2::new(x, y)
 }
 
 // --------------------------------------------------------------------------------
-// --- 各フィルタの実装 (変更なし) ---
+// --- 違いが見えるように: 基本のカルマンフィルタ(KF)の実装 ---
 // --------------------------------------------------------------------------------
-// (ここに、以前のKF, EKF, UKF, CKF, RCKFの`struct`と`impl`をそのまま貼り付けます)
+// NOTE: 状態予測を「行列F * 状態x」という線形計算に変更。
+//       非線形なシステムに対してこの計算を行うため、EKFとは異なる（そして通常は劣る）結果となる。
 struct KalmanFilter {
     x: Vector4<f64>,
     p: Matrix4<f64>,
@@ -34,11 +37,12 @@ struct KalmanFilter {
     r: Matrix2<f64>,
     dt: f64,
 }
+
 impl KalmanFilter {
     pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
         let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
         let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
-        Self {
+        KalmanFilter {
             x: initial_x,
             p: initial_p,
             q,
@@ -46,6 +50,8 @@ impl KalmanFilter {
             dt,
         }
     }
+
+    /// 状態遷移行列 F (ヤコビアンで線形化)
     fn calculate_state_transition_matrix(&self, x_prev: &Vector4<f64>) -> Matrix4<f64> {
         let v = x_prev[2];
         let theta = x_prev[3];
@@ -69,27 +75,38 @@ impl KalmanFilter {
             1.0,
         )
     }
+
+    /// 観測行列 H
     fn get_observation_matrix(&self) -> SMatrix<f64, 2, 4> {
-        SMatrix::<f64, 2, 4>::new(1., 0., 0., 0., 0., 1., 0., 0.)
+        SMatrix::<f64, 2, 4>::new(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
     }
+
     pub fn predict(&mut self) {
         let f = self.calculate_state_transition_matrix(&self.x);
         self.x = f * self.x;
         self.p = f * self.p * f.transpose() + self.q;
     }
+
     pub fn update(&mut self, z: Vector2<f64>) {
         let h = self.get_observation_matrix();
         let y = z - h * self.x;
         let s = h * self.p * h.transpose() + self.r;
-        let s_inv = s.try_inverse().unwrap();
+        let s_inv = s.try_inverse().expect("KF: S行列が逆行列を持たない");
         let k = self.p * h.transpose() * s_inv;
         self.x += k * y;
         self.p = (Matrix4::identity() - k * h) * self.p;
     }
-    pub fn get_state(&self) -> &Vector4<f64> {
-        &self.x
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
     }
 }
+
+// --------------------------------------------------------------------------------
+// --- 拡張カルマンフィルタ(EKF)の実装 ---
+// --------------------------------------------------------------------------------
+// NOTE: 状態予測には非線形関数を直接使い、共分散予測に線形化を用いる。
+//       これによりKFよりも高い精度を実現する。
 struct ExtendedKalmanFilter {
     x: Vector4<f64>,
     p: Matrix4<f64>,
@@ -97,11 +114,12 @@ struct ExtendedKalmanFilter {
     r: Matrix2<f64>,
     dt: f64,
 }
+
 impl ExtendedKalmanFilter {
     pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
         let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
         let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
-        Self {
+        ExtendedKalmanFilter {
             x: initial_x,
             p: initial_p,
             q,
@@ -109,48 +127,59 @@ impl ExtendedKalmanFilter {
             dt,
         }
     }
+
     fn calculate_jacobian_f(&self, x_prev: &Vector4<f64>) -> Matrix4<f64> {
         let v = x_prev[2];
         let theta = x_prev[3];
         let dt = self.dt;
         Matrix4::new(
-            1.,
-            0.,
+            1.0,
+            0.0,
             dt * theta.cos(),
             -v * dt * theta.sin(),
-            0.,
-            1.,
+            0.0,
+            1.0,
             dt * theta.sin(),
             v * dt * theta.cos(),
-            0.,
-            0.,
-            1.,
-            0.,
-            0.,
-            0.,
-            0.,
-            1.,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
         )
     }
+
+    fn calculate_jacobian_h(&self) -> SMatrix<f64, 2, 4> {
+        SMatrix::<f64, 2, 4>::new(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    }
+
     pub fn predict(&mut self) {
         let f_jacobian = self.calculate_jacobian_f(&self.x);
         self.x = state_transition_function(&self.x, self.dt);
         self.p = f_jacobian * self.p * f_jacobian.transpose() + self.q;
     }
+
     pub fn update(&mut self, z: Vector2<f64>) {
-        let h_jacobian = SMatrix::<f64, 2, 4>::new(1., 0., 0., 0., 0., 1., 0., 0.);
+        let h_jacobian = self.calculate_jacobian_h();
         let y = z - observation_function(&self.x);
-        let s_inv = (h_jacobian * self.p * h_jacobian.transpose() + self.r)
-            .try_inverse()
-            .unwrap();
+        let s = h_jacobian * self.p * h_jacobian.transpose() + self.r;
+        let s_inv = s.try_inverse().expect("EKF: S行列が逆行列を持たない");
         let k = self.p * h_jacobian.transpose() * s_inv;
         self.x += k * y;
         self.p = (Matrix4::identity() - k * h_jacobian) * self.p;
     }
-    pub fn get_state(&self) -> &Vector4<f64> {
-        &self.x
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
     }
 }
+
+// --------------------------------------------------------------------------------
+// --- アンセンテッドカルマンフィルタ(UKF)の実装 ---
+// --------------------------------------------------------------------------------
 struct UnscentedKalmanFilter {
     x: Vector4<f64>,
     p: Matrix4<f64>,
@@ -162,6 +191,7 @@ struct UnscentedKalmanFilter {
     lambda: f64,
     n: usize,
 }
+
 impl UnscentedKalmanFilter {
     pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
         let n = 4;
@@ -169,6 +199,7 @@ impl UnscentedKalmanFilter {
         let kappa: f64 = 0.0;
         let beta: f64 = 2.0;
         let lambda = alpha.powi(2) * (n as f64 + kappa) - n as f64;
+
         let mut weights_m = SMatrix::<f64, 1, 9>::zeros();
         let mut weights_c = SMatrix::<f64, 1, 9>::zeros();
         weights_m[(0, 0)] = lambda / (n as f64 + lambda);
@@ -177,9 +208,11 @@ impl UnscentedKalmanFilter {
             weights_m[(0, i)] = 0.5 / (n as f64 + lambda);
             weights_c[(0, i)] = 0.5 / (n as f64 + lambda);
         }
+
         let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
         let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
-        Self {
+
+        UnscentedKalmanFilter {
             x: initial_x,
             p: initial_p,
             q,
@@ -191,10 +224,11 @@ impl UnscentedKalmanFilter {
             n,
         }
     }
+
     fn generate_sigma_points(&self) -> SMatrix<f64, 4, 9> {
         let mut sigma_points = SMatrix::<f64, 4, 9>::zeros();
         let p_sqrt = Cholesky::new((self.n as f64 + self.lambda) * self.p)
-            .unwrap()
+            .expect("UKF: Pのコレスキー分解に失敗")
             .l();
         sigma_points.set_column(0, &self.x);
         for i in 0..self.n {
@@ -203,6 +237,7 @@ impl UnscentedKalmanFilter {
         }
         sigma_points
     }
+
     pub fn predict(&mut self) {
         let sigma_points = self.generate_sigma_points();
         let mut predicted_sigma_points = SMatrix::<f64, 4, 9>::zeros();
@@ -220,6 +255,7 @@ impl UnscentedKalmanFilter {
         }
         self.p = p_pred + self.q;
     }
+
     pub fn update(&mut self, z: Vector2<f64>) {
         let sigma_points = self.generate_sigma_points();
         let mut observed_sigma_points = SMatrix::<f64, 2, 9>::zeros();
@@ -237,14 +273,19 @@ impl UnscentedKalmanFilter {
             t += self.weights_c[(0, i)] * (x_diff * z_diff.transpose());
         }
         s += self.r;
-        let k = t * s.try_inverse().unwrap();
+        let k = t * s.try_inverse().expect("UKF: S行列が逆行列を持たない");
         self.x += k * (z - z_pred);
         self.p -= k * s * k.transpose();
     }
-    pub fn get_state(&self) -> &Vector4<f64> {
-        &self.x
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
     }
 }
+
+// --------------------------------------------------------------------------------
+// --- キューバチャーカルマンフィルタ(CKF)の実装 ---
+// --------------------------------------------------------------------------------
 struct CubatureKalmanFilter {
     x: Vector4<f64>,
     p: Matrix4<f64>,
@@ -253,11 +294,12 @@ struct CubatureKalmanFilter {
     dt: f64,
     n: usize,
 }
+
 impl CubatureKalmanFilter {
     pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
         let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
         let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
-        Self {
+        CubatureKalmanFilter {
             x: initial_x,
             p: initial_p,
             q,
@@ -266,10 +308,12 @@ impl CubatureKalmanFilter {
             n: 4,
         }
     }
+
     fn generate_cubature_points(&self, x: &Vector4<f64>, p: &Matrix4<f64>) -> SMatrix<f64, 4, 8> {
         let mut points = SMatrix::<f64, 4, 8>::zeros();
-        let s = Cholesky::new(*p).unwrap().l();
+        let s = Cholesky::new(*p).expect("CKF: Pのコレスキー分解に失敗").l();
         let factor = (self.n as f64).sqrt();
+
         for i in 0..self.n {
             let s_col = s.column(i);
             points.set_column(i, &(x + factor * s_col));
@@ -277,6 +321,7 @@ impl CubatureKalmanFilter {
         }
         points
     }
+
     pub fn predict(&mut self) {
         let points = self.generate_cubature_points(&self.x, &self.p);
         let mut propagated_points = SMatrix::<f64, 4, 8>::zeros();
@@ -286,6 +331,7 @@ impl CubatureKalmanFilter {
                 &state_transition_function(&points.column(i).into(), self.dt),
             );
         }
+
         self.x = propagated_points.column_mean();
         let mut p_pred = Matrix4::zeros();
         for i in 0..(2 * self.n) {
@@ -294,12 +340,14 @@ impl CubatureKalmanFilter {
         }
         self.p = p_pred / (2.0 * self.n as f64) + self.q;
     }
+
     pub fn update(&mut self, z: Vector2<f64>) {
         let points = self.generate_cubature_points(&self.x, &self.p);
         let mut observed_points = SMatrix::<f64, 2, 8>::zeros();
         for i in 0..(2 * self.n) {
             observed_points.set_column(i, &observation_function(&points.column(i).into()));
         }
+
         let z_pred: Vector2<f64> = observed_points.column_mean();
         let mut p_zz = Matrix2::zeros();
         let mut p_xz = SMatrix::<f64, 4, 2>::zeros();
@@ -312,14 +360,20 @@ impl CubatureKalmanFilter {
         let weight = 1.0 / (2.0 * self.n as f64);
         let p_zz = weight * p_zz + self.r;
         let p_xz = weight * p_xz;
-        let k = p_xz * p_zz.try_inverse().unwrap();
+
+        let k = p_xz * p_zz.try_inverse().expect("CKF: S行列が逆行列を持たない");
         self.x += k * (z - z_pred);
         self.p -= k * p_zz * k.transpose();
     }
-    pub fn get_state(&self) -> &Vector4<f64> {
-        &self.x
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
     }
 }
+
+// --------------------------------------------------------------------------------
+// --- ロバストキューバチャーカルマンフィルタ(RCKF)の実装 ---
+// --------------------------------------------------------------------------------
 struct RobustCubatureKalmanFilter {
     x: Vector4<f64>,
     p: Matrix4<f64>,
@@ -327,25 +381,32 @@ struct RobustCubatureKalmanFilter {
     r: Matrix2<f64>,
     dt: f64,
     n: usize,
-    mahalanobis_threshold: f64,
+    mahalanobis_threshold: f64, // 異常値検出のしきい値
 }
+
 impl RobustCubatureKalmanFilter {
     pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
         let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
         let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
-        Self {
+        // 自由度2のカイ二乗分布における95%点。これを超えたら異常値とみなす
+        let mahalanobis_threshold = 5.991;
+        RobustCubatureKalmanFilter {
             x: initial_x,
             p: initial_p,
             q,
             r,
             dt,
             n: 4,
-            mahalanobis_threshold: 5.991,
+            mahalanobis_threshold,
         }
     }
+
+    // CKFと共通の関数
     fn generate_cubature_points(&self, x: &Vector4<f64>, p: &Matrix4<f64>) -> SMatrix<f64, 4, 8> {
         let mut points = SMatrix::<f64, 4, 8>::zeros();
-        let s = Cholesky::new(*p).unwrap().l();
+        let s = Cholesky::new(*p)
+            .expect("RCKF: Pのコレスキー分解に失敗")
+            .l();
         let factor = (self.n as f64).sqrt();
         for i in 0..self.n {
             points.set_column(i, &(x + factor * s.column(i)));
@@ -353,6 +414,8 @@ impl RobustCubatureKalmanFilter {
         }
         points
     }
+
+    // CKFと共通
     pub fn predict(&mut self) {
         let points = self.generate_cubature_points(&self.x, &self.p);
         let mut propagated_points = SMatrix::<f64, 4, 8>::zeros();
@@ -370,6 +433,7 @@ impl RobustCubatureKalmanFilter {
         }
         self.p = p_pred / (2.0 * self.n as f64) + self.q;
     }
+
     pub fn update(&mut self, z: Vector2<f64>) {
         let points = self.generate_cubature_points(&self.x, &self.p);
         let mut observed_points = SMatrix::<f64, 2, 8>::zeros();
@@ -377,74 +441,86 @@ impl RobustCubatureKalmanFilter {
             observed_points.set_column(i, &observation_function(&points.column(i).into()));
         }
         let z_pred: Vector2<f64> = observed_points.column_mean();
+
         let mut p_zz_innovation = Matrix2::zeros();
         let mut p_xz = SMatrix::<f64, 4, 2>::zeros();
         let weight = 1.0 / (2.0 * self.n as f64);
+
         for i in 0..(2 * self.n) {
             let z_diff = observed_points.column(i) - z_pred;
             let x_diff = points.column(i) - self.x;
             p_zz_innovation += z_diff * z_diff.transpose();
             p_xz += x_diff * z_diff.transpose();
         }
+
         let p_zz_innovation = weight * p_zz_innovation;
         let p_xz = weight * p_xz;
+
         let innovation = z - z_pred;
         let p_zz = p_zz_innovation + self.r;
+
+        // マハラノビス距離の二乗を計算して異常値を検出
         let mahalanobis_sq = innovation.transpose() * p_zz.try_inverse().unwrap() * innovation;
+
         let r_eff = if mahalanobis_sq[(0, 0)] > self.mahalanobis_threshold {
+            // 異常値の場合、観測ノイズを100倍にして観測の重みを下げる
+            // println!("RCKF Outlier Detected at z={:?}", z); // デバッグ用
             self.r * 100.0
         } else {
+            // 通常時はそのまま
             self.r
         };
+
+        // 更新されたRを使って再計算
         let p_zz_eff = p_zz_innovation + r_eff;
-        let k = p_xz * p_zz_eff.try_inverse().unwrap();
+        let k = p_xz
+            * p_zz_eff
+                .try_inverse()
+                .expect("RCKF: S行列が逆行列を持たない");
         self.x += k * innovation;
         self.p -= k * p_zz_eff * k.transpose();
     }
-    pub fn get_state(&self) -> &Vector4<f64> {
-        &self.x
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
     }
 }
 
 // --------------------------------------------------------------------------------
 // --- メインのシミュレーションと描画 ---
 // --------------------------------------------------------------------------------
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    let mut rng = rand::rng();
     let dt = 0.1;
+
     let initial_x = Vector4::new(0.0, 0.0, 1.0, 0.0);
     let initial_p = Matrix4::from_diagonal(&Vector4::new(100.0, 100.0, 10.0, 10.0));
 
-    // --- 各フィルタのインスタンス化 ---
-    let mut filters: Vec<(&str, Box<dyn KalmanLike>)> = vec![
-        ("KF", Box::new(KalmanFilter::new(initial_x, initial_p, dt))),
-        (
-            "EKF",
-            Box::new(ExtendedKalmanFilter::new(initial_x, initial_p, dt)),
-        ),
-        (
-            "UKF",
-            Box::new(UnscentedKalmanFilter::new(initial_x, initial_p, dt)),
-        ),
-        (
-            "CKF",
-            Box::new(CubatureKalmanFilter::new(initial_x, initial_p, dt)),
-        ),
-        (
-            "RCKF",
-            Box::new(RobustCubatureKalmanFilter::new(initial_x, initial_p, dt)),
-        ),
-    ];
+    // --- 5つのフィルタをインスタンス化 ---
+    let mut kf = KalmanFilter::new(initial_x, initial_p, dt);
+    let mut ekf = ExtendedKalmanFilter::new(initial_x, initial_p, dt);
+    let mut ukf = UnscentedKalmanFilter::new(initial_x, initial_p, dt);
+    let mut ckf = CubatureKalmanFilter::new(initial_x, initial_p, dt);
+    let mut rckf = RobustCubatureKalmanFilter::new(initial_x, initial_p, dt);
 
-    // --- シミュレーション履歴の保存用 ---
-    let mut true_history = Vec::new();
-    let mut obs_history = Vec::new();
-    let mut estimates_history: Vec<Vec<(f64, f64)>> = vec![Vec::new(); filters.len()];
-    let mut outlier_indices = Vec::new();
+    println!("KF, EKF, UKF, CKF, RCKF 比較シミュレーションを開始します。");
+    println!("{:-<300}", "");
+    println!(
+        "{:<6} | {:<36} | {:<22} | {:<36} | {:<38} | {:<33} | {:<33} | {:<40}",
+        "ステップ",
+        "真の状態",
+        "観測値",
+        "線形近似 KF",
+        "拡張 KF (EKF)",
+        "アンセンテッドKF (UKF)",
+        "キューバチャーKF (CKF)",
+        "ロバストCKF (RCKF)"
+    );
+    println!("{:-<300}", "");
 
-    let mut rng = rand::rng();
-
-    // --- シミュレーションループ ---
+    // シミュレーションループ
     for i in 0..100 {
+        // 真の状態 (円運動)
         let true_v = 1.0;
         let true_angular_velocity = 0.05;
         let true_theta = true_angular_velocity * (i as f64 + 1.0) * dt;
@@ -452,149 +528,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let true_x_curr = initial_x[0] + radius * true_theta.sin();
         let true_y_curr = initial_x[1] + radius * (1.0 - true_theta.cos());
         let true_state = Vector4::new(true_x_curr, true_y_curr, true_v, true_theta);
-        true_history.push((true_state[0], true_state[1]));
 
+        // 観測値の生成 (真の位置にノイズを加える)
         let mut observation_noise_x = (rng.random::<f64>() - 0.5) * 0.5;
         let mut observation_noise_y = (rng.random::<f64>() - 0.5) * 0.5;
 
+        // ステップ30と60で意図的に外れ値を注入
         if i == 30 || i == 60 {
-            observation_noise_x += 10.0;
-            observation_noise_y -= 10.0;
-            outlier_indices.push(obs_history.len());
+            if i == 30 {
+                println!("\n--- 外れ値注入 (Step {i}) ---\n");
+            }
+            observation_noise_x += 10.0; // x方向に大きなノイズ
+            observation_noise_y -= 10.0; // y方向に大きなノイズ
         }
 
-        let observation = observation_function(&true_state)
-            + Vector2::new(observation_noise_x, observation_noise_y);
-        obs_history.push((observation[0], observation[1]));
+        let observation = Vector2::new(
+            true_state[0] + observation_noise_x,
+            true_state[1] + observation_noise_y,
+        );
 
-        for (idx, (_, f)) in filters.iter_mut().enumerate() {
-            f.predict();
-            f.update(observation);
-            let state = f.get_state();
-            estimates_history[idx].push((state[0], state[1]));
+        // --- 各フィルタの予測と更新 ---
+        kf.predict();
+        kf.update(observation);
+
+        ekf.predict();
+        ekf.update(observation);
+
+        ukf.predict();
+        ukf.update(observation);
+
+        ckf.predict();
+        ckf.update(observation);
+
+        rckf.predict();
+        rckf.update(observation);
+
+        // --- 結果表示 ---
+        if i % 10 == 0 || i == 99 || i == 30 || i == 60 {
+            // 外れ値注入ステップも表示
+            let true_str = format!(
+                "x={:5.2}, y={:5.2}, v={:4.2}, th={:4.2}",
+                true_state[0], true_state[1], true_state[2], true_state[3]
+            );
+            let obs_str = format!("x={:5.2}, y={:5.2}", observation[0], observation[1]);
+            let format_state = |s: Vector4<f64>| {
+                format!(
+                    "x={:5.2}, y={:5.2}, v={:4.2}, th={:4.2}",
+                    s[0], s[1], s[2], s[3]
+                )
+            };
+
+            let kf_str = format_state(kf.get_state());
+            let ekf_str = format_state(ekf.get_state());
+            let ukf_str = format_state(ukf.get_state());
+            let ckf_str = format_state(ckf.get_state());
+            let rckf_str = format_state(rckf.get_state());
+
+            println!(
+                "Step {i:<5} | {true_str:<40} | {obs_str:<25} | {kf_str:<40} | {ekf_str:<40} | {ukf_str:<40} | {ckf_str:<40} | {rckf_str:<40}",
+            );
+
+            if i == 30 {
+                println!("\n--- 外れ値注入後の復帰過程 ---\n");
+            }
         }
     }
-
-    // --- グラフ描画 ---
-    let root_area =
-        BitMapBackend::new("rust_plotters_comparison.png", (1024, 768)).into_drawing_area();
-    root_area.fill(&WHITE)?;
-
-    let mut chart = ChartBuilder::on(&root_area)
-        .caption("Kalman Filter Comparison", ("sans-serif", 50).into_font())
-        .margin(10)
-        .x_label_area_size(30)
-        .y_label_area_size(30)
-        .build_cartesian_2d(-5f64..25f64, -5f64..25f64)?;
-
-    chart.configure_mesh().draw()?;
-
-    // 観測点
-    chart
-        .draw_series(
-            obs_history
-                .iter()
-                .map(|(x, y)| Cross::new((*x, *y), 5, &GREY)),
-        )?
-        .label("Observations")
-        .legend(|(x, y)| Cross::new((x, y), 5, &GREY));
-
-    // 外れ値
-    chart
-        .draw_series(
-            outlier_indices
-                .iter()
-                .map(|&i| Circle::new(obs_history[i], 8, RED.stroke_width(2))),
-        )?
-        .label("Outlier")
-        .legend(|(x, y)| Circle::new((x, y), 8, RED.stroke_width(2)));
-
-    // 真の軌跡
-    chart
-        .draw_series(LineSeries::new(true_history, &BLACK))?
-        .label("True Path")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
-
-    // 各フィルタの推定軌跡
-    let colors = [ORANGE, GREEN, RED, PURPLE, BLUE];
-    for (i, (name, _)) in filters.iter().enumerate() {
-        chart
-            .draw_series(LineSeries::new(estimates_history[i].clone(), &colors[i]))?
-            .label(*name)
-            .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &colors[i]));
-    }
-
-    chart
-        .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
-        .draw()?;
-
-    root_area.present()?;
-    println!("Graph saved to rust_plotters_comparison.png");
-
-    Ok(())
-}
-
-// --- フィルタを動的に扱うためのトレイト ---
-trait KalmanLike {
-    fn predict(&mut self);
-    fn update(&mut self, z: Vector2<f64>);
-    fn get_state(&self) -> &Vector4<f64>;
-}
-
-impl KalmanLike for KalmanFilter {
-    fn predict(&mut self) {
-        self.predict()
-    }
-    fn update(&mut self, z: Vector2<f64>) {
-        self.update(z)
-    }
-    fn get_state(&self) -> &Vector4<f64> {
-        self.get_state()
-    }
-}
-impl KalmanLike for ExtendedKalmanFilter {
-    fn predict(&mut self) {
-        self.predict()
-    }
-    fn update(&mut self, z: Vector2<f64>) {
-        self.update(z)
-    }
-    fn get_state(&self) -> &Vector4<f64> {
-        self.get_state()
-    }
-}
-impl KalmanLike for UnscentedKalmanFilter {
-    fn predict(&mut self) {
-        self.predict()
-    }
-    fn update(&mut self, z: Vector2<f64>) {
-        self.update(z)
-    }
-    fn get_state(&self) -> &Vector4<f64> {
-        self.get_state()
-    }
-}
-impl KalmanLike for CubatureKalmanFilter {
-    fn predict(&mut self) {
-        self.predict()
-    }
-    fn update(&mut self, z: Vector2<f64>) {
-        self.update(z)
-    }
-    fn get_state(&self) -> &Vector4<f64> {
-        self.get_state()
-    }
-}
-impl KalmanLike for RobustCubatureKalmanFilter {
-    fn predict(&mut self) {
-        self.predict()
-    }
-    fn update(&mut self, z: Vector2<f64>) {
-        self.update(z)
-    }
-    fn get_state(&self) -> &Vector4<f64> {
-        self.get_state()
-    }
+    println!("\nシミュレーション終了。");
 }
