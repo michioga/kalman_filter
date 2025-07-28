@@ -8,6 +8,7 @@ use rand::Rng;
 // --------------------------------------------------------------------------------
 
 /// 状態遷移関数 f(x) (非線形)
+/// 一定速度・一定角速度で動くモデル (Coordinated Turn Model)
 fn state_transition_function(x_prev: &Vector4<f64>, dt: f64) -> Vector4<f64> {
     let x = x_prev[0];
     let y = x_prev[1];
@@ -17,6 +18,7 @@ fn state_transition_function(x_prev: &Vector4<f64>, dt: f64) -> Vector4<f64> {
 }
 
 /// 観測関数 h(x) (線形)
+/// 状態のうち、位置(x, y)のみを観測する
 fn observation_function(x_curr: &Vector4<f64>) -> Vector2<f64> {
     let x = x_curr[0];
     let y = x_curr[1];
@@ -81,19 +83,13 @@ impl KalmanFilter {
 
     pub fn predict(&mut self) {
         let f = self.calculate_state_transition_matrix(&self.x);
-
-        // ★★★ 変更点 ★★★
-        // 状態予測を線形モデル（行列乗算）で行う。
-        // これがEKFとの決定的な違いを生む。
         self.x = f * self.x;
-
-        // 共分散の予測
         self.p = f * self.p * f.transpose() + self.q;
     }
 
     pub fn update(&mut self, z: Vector2<f64>) {
         let h = self.get_observation_matrix();
-        let y = z - h * self.x; // 観測も線形計算
+        let y = z - h * self.x;
         let s = h * self.p * h.transpose() + self.r;
         let s_inv = s.try_inverse().expect("KF: S行列が逆行列を持たない");
         let k = self.p * h.transpose() * s_inv;
@@ -162,20 +158,15 @@ impl ExtendedKalmanFilter {
 
     pub fn predict(&mut self) {
         let f_jacobian = self.calculate_jacobian_f(&self.x);
-
-        // EKFは状態予測に「真の非線形関数」を使う
         self.x = state_transition_function(&self.x, self.dt);
-
-        // 共分散予測に線形化した行列を使う
         self.p = f_jacobian * self.p * f_jacobian.transpose() + self.q;
     }
 
     pub fn update(&mut self, z: Vector2<f64>) {
         let h_jacobian = self.calculate_jacobian_h();
         let y = z - observation_function(&self.x);
-        let s_inv = (h_jacobian * self.p * h_jacobian.transpose() + self.r)
-            .try_inverse()
-            .expect("EKF: S行列が逆行列を持たない");
+        let s = h_jacobian * self.p * h_jacobian.transpose() + self.r;
+        let s_inv = s.try_inverse().expect("EKF: S行列が逆行列を持たない");
         let k = self.p * h_jacobian.transpose() * s_inv;
         self.x += k * y;
         self.p = (Matrix4::identity() - k * h_jacobian) * self.p;
@@ -381,6 +372,121 @@ impl CubatureKalmanFilter {
 }
 
 // --------------------------------------------------------------------------------
+// --- ロバストキューバチャーカルマンフィルタ(RCKF)の実装 ---
+// --------------------------------------------------------------------------------
+struct RobustCubatureKalmanFilter {
+    x: Vector4<f64>,
+    p: Matrix4<f64>,
+    q: Matrix4<f64>,
+    r: Matrix2<f64>,
+    dt: f64,
+    n: usize,
+    mahalanobis_threshold: f64, // 異常値検出のしきい値
+}
+
+impl RobustCubatureKalmanFilter {
+    pub fn new(initial_x: Vector4<f64>, initial_p: Matrix4<f64>, dt: f64) -> Self {
+        let q = Matrix4::from_diagonal(&Vector4::new(0.01, 0.01, 0.001, 0.001));
+        let r = Matrix2::from_diagonal(&Vector2::new(0.1, 0.1));
+        // 自由度2のカイ二乗分布における95%点。これを超えたら異常値とみなす
+        let mahalanobis_threshold = 5.991;
+        RobustCubatureKalmanFilter {
+            x: initial_x,
+            p: initial_p,
+            q,
+            r,
+            dt,
+            n: 4,
+            mahalanobis_threshold,
+        }
+    }
+
+    // CKFと共通の関数
+    fn generate_cubature_points(&self, x: &Vector4<f64>, p: &Matrix4<f64>) -> SMatrix<f64, 4, 8> {
+        let mut points = SMatrix::<f64, 4, 8>::zeros();
+        let s = Cholesky::new(*p)
+            .expect("RCKF: Pのコレスキー分解に失敗")
+            .l();
+        let factor = (self.n as f64).sqrt();
+        for i in 0..self.n {
+            points.set_column(i, &(x + factor * s.column(i)));
+            points.set_column(i + self.n, &(x - factor * s.column(i)));
+        }
+        points
+    }
+
+    // CKFと共通
+    pub fn predict(&mut self) {
+        let points = self.generate_cubature_points(&self.x, &self.p);
+        let mut propagated_points = SMatrix::<f64, 4, 8>::zeros();
+        for i in 0..(2 * self.n) {
+            propagated_points.set_column(
+                i,
+                &state_transition_function(&points.column(i).into(), self.dt),
+            );
+        }
+        self.x = propagated_points.column_mean();
+        let mut p_pred = Matrix4::zeros();
+        for i in 0..(2 * self.n) {
+            let diff = propagated_points.column(i) - self.x;
+            p_pred += diff * diff.transpose();
+        }
+        self.p = p_pred / (2.0 * self.n as f64) + self.q;
+    }
+
+    pub fn update(&mut self, z: Vector2<f64>) {
+        let points = self.generate_cubature_points(&self.x, &self.p);
+        let mut observed_points = SMatrix::<f64, 2, 8>::zeros();
+        for i in 0..(2 * self.n) {
+            observed_points.set_column(i, &observation_function(&points.column(i).into()));
+        }
+        let z_pred: Vector2<f64> = observed_points.column_mean();
+
+        let mut p_zz_innovation = Matrix2::zeros();
+        let mut p_xz = SMatrix::<f64, 4, 2>::zeros();
+        let weight = 1.0 / (2.0 * self.n as f64);
+
+        for i in 0..(2 * self.n) {
+            let z_diff = observed_points.column(i) - z_pred;
+            let x_diff = points.column(i) - self.x;
+            p_zz_innovation += z_diff * z_diff.transpose();
+            p_xz += x_diff * z_diff.transpose();
+        }
+
+        let p_zz_innovation = weight * p_zz_innovation;
+        let p_xz = weight * p_xz;
+
+        let innovation = z - z_pred;
+        let p_zz = p_zz_innovation + self.r;
+
+        // マハラノビス距離の二乗を計算して異常値を検出
+        let mahalanobis_sq = innovation.transpose() * p_zz.try_inverse().unwrap() * innovation;
+
+        let r_eff = if mahalanobis_sq[(0, 0)] > self.mahalanobis_threshold {
+            // 異常値の場合、観測ノイズを100倍にして観測の重みを下げる
+            // println!("RCKF Outlier Detected at z={:?}", z); // デバッグ用
+            self.r * 100.0
+        } else {
+            // 通常時はそのまま
+            self.r
+        };
+
+        // 更新されたRを使って再計算
+        let p_zz_eff = p_zz_innovation + r_eff;
+        let k = p_xz
+            * p_zz_eff
+                .try_inverse()
+                .expect("RCKF: S行列が逆行列を持たない");
+        self.x += k * innovation;
+        self.p -= k * p_zz_eff * k.transpose();
+    }
+
+    pub fn get_state(&self) -> Vector4<f64> {
+        self.x
+    }
+}
+
+// --------------------------------------------------------------------------------
 // --- メインのシミュレーション ---
 // --------------------------------------------------------------------------------
 fn main() {
@@ -390,25 +496,27 @@ fn main() {
     let initial_x = Vector4::new(0.0, 0.0, 1.0, 0.0);
     let initial_p = Matrix4::from_diagonal(&Vector4::new(100.0, 100.0, 10.0, 10.0));
 
-    // --- 4つのフィルタをインスタンス化 ---
+    // --- 5つのフィルタをインスタンス化 ---
     let mut kf = KalmanFilter::new(initial_x, initial_p, dt);
     let mut ekf = ExtendedKalmanFilter::new(initial_x, initial_p, dt);
     let mut ukf = UnscentedKalmanFilter::new(initial_x, initial_p, dt);
     let mut ckf = CubatureKalmanFilter::new(initial_x, initial_p, dt);
+    let mut rckf = RobustCubatureKalmanFilter::new(initial_x, initial_p, dt);
 
-    println!("KF, EKF, UKF, CKF 比較シミュレーションを開始します。");
-    println!("{:-<250}", "");
+    println!("KF, EKF, UKF, CKF, RCKF 比較シミュレーションを開始します。");
+    println!("{:-<300}", "");
     println!(
-        "{:<6} | {:<36} | {:<22} | {:<36} | {:<38} | {:<33} | {:<40}",
+        "{:<6} | {:<36} | {:<22} | {:<36} | {:<38} | {:<33} | {:<33} | {:<40}",
         "ステップ",
         "真の状態",
         "観測値",
         "線形近似 KF",
         "拡張 KF (EKF)",
-        "アンセンテッド KF (UKF)",
-        "キューバチャー KF (CKF)",
+        "アンセンテッドKF (UKF)",
+        "キューバチャーKF (CKF)",
+        "ロバストCKF (RCKF)"
     );
-    println!("{:-<250}", "");
+    println!("{:-<300}", "");
 
     // シミュレーションループ
     for i in 0..100 {
@@ -422,8 +530,18 @@ fn main() {
         let true_state = Vector4::new(true_x_curr, true_y_curr, true_v, true_theta);
 
         // 観測値の生成 (真の位置にノイズを加える)
-        let observation_noise_x = (rng.random::<f64>() - 0.5) * 0.5;
-        let observation_noise_y = (rng.random::<f64>() - 0.5) * 0.5;
+        let mut observation_noise_x = (rng.random::<f64>() - 0.5) * 0.5;
+        let mut observation_noise_y = (rng.random::<f64>() - 0.5) * 0.5;
+
+        // ステップ30と60で意図的に外れ値を注入
+        if i == 30 || i == 60 {
+            if i == 30 {
+                println!("\n--- 外れ値注入 (Step {i}) ---\n");
+            }
+            observation_noise_x += 10.0; // x方向に大きなノイズ
+            observation_noise_y -= 10.0; // y方向に大きなノイズ
+        }
+
         let observation = Vector2::new(
             true_state[0] + observation_noise_x,
             true_state[1] + observation_noise_y,
@@ -442,28 +560,37 @@ fn main() {
         ckf.predict();
         ckf.update(observation);
 
+        rckf.predict();
+        rckf.update(observation);
+
         // --- 結果表示 ---
-        if i % 10 == 0 || i == 99 {
+        if i % 10 == 0 || i == 99 || i == 30 || i == 60 {
+            // 外れ値注入ステップも表示
             let true_str = format!(
                 "x={:5.2}, y={:5.2}, v={:4.2}, th={:4.2}",
                 true_state[0], true_state[1], true_state[2], true_state[3]
             );
             let obs_str = format!("x={:5.2}, y={:5.2}", observation[0], observation[1]);
-
             let format_state = |s: Vector4<f64>| {
                 format!(
                     "x={:5.2}, y={:5.2}, v={:4.2}, th={:4.2}",
                     s[0], s[1], s[2], s[3]
                 )
             };
+
             let kf_str = format_state(kf.get_state());
             let ekf_str = format_state(ekf.get_state());
             let ukf_str = format_state(ukf.get_state());
             let ckf_str = format_state(ckf.get_state());
+            let rckf_str = format_state(rckf.get_state());
 
             println!(
-                "Step {i:<5} | {true_str:<40} | {obs_str:<25} | {kf_str:<40} | {ekf_str:<40} | {ukf_str:<40} | {ckf_str:<40}",
+                "Step {i:<5} | {true_str:<40} | {obs_str:<25} | {kf_str:<40} | {ekf_str:<40} | {ukf_str:<40} | {ckf_str:<40} | {rckf_str:<40}",
             );
+
+            if i == 30 {
+                println!("\n--- 外れ値注入後の復帰過程 ---\n");
+            }
         }
     }
     println!("\nシミュレーション終了。");
