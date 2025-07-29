@@ -22,7 +22,7 @@
     このため、フィルタの内部モデルと真の運動の間には常に**モデル化誤差**が存在します。
 
 * **観測方程式 $`z_k = h(x_k) + v_k`$ (非線形)**: 観測は、原点`(0,0,0)`にあるセンサーから得られる**距離(range)**、**方位角(azimuth)**、**仰角(elevation)**です。
-    $`z_k = \begin{bmatrix} r \\ \alpha \\ \epsilon \end{bmatrix} = h(x_k) + v_k = \begin{bmatrix} \sqrt{p_x^2 + p_y^2 + p_z^2} \\ \operatorname{atan2}(p_y, p_x) \\ \operatorname{atan2}(p_z, \sqrt{p_x^2 + p_y^2}) \end{bmatrix} + v_k`$
+    $`z_k = \begin{bmatrix} r \\ \alpha \\ \epsilon \end{bmatrix} = h(x_k) + v_k = \begin{bmatrix} \sqrt{p_x^2 + p_y^2 + p_z^2} \\ \text{atan2}(p_y, p_x) \\ \text{atan2}(p_z, \sqrt{p_x^2 + p_y^2}) \end{bmatrix} + v_k`$
     この観測関数 $`h(\cdot)`$ は強い非線形性を持っています。
 
 ### 各フィルタの役割
