@@ -1,1 +1,4 @@
 /target
+/frames
+*.mp4
+Cargo.lock

@@ -2,7 +2,7 @@
 
 use nalgebra::{Cholesky, Matrix3, Matrix6, SMatrix, Vector3, Vector6};
 use plotters::prelude::*;
-use plotters::prelude::full_palette::{BLUE, CYAN, GREEN, GREY, ORANGE, PURPLE, RED};
+use plotters::prelude::full_palette::{BLUE, CYAN, GREEN, GREY, ORANGE, PURPLE, RED, BLACK, WHITE};
 use rand::prelude::*;
 use std::f64::consts::PI;
 use std::fs::create_dir_all;
@@ -259,7 +259,7 @@ struct RobustCubatureKalmanFilter {
 }
 impl RobustCubatureKalmanFilter {
     pub fn new(initial_x: Vector6<f64>, initial_p: Matrix6<f64>, q: Matrix6<f64>, r: Matrix3<f64>, dt: f64) -> Self {
-        Self { x: initial_x, p: initial_p, q, r, dt, mahalanobis_threshold: 7.815 }
+        Self { x: initial_x, p: initial_p, q, r, dt, mahalanobis_threshold: 7.815 } // Chi-squared 3-DOF, p=0.05
     }
     fn generate_cubature_points(&self, x: &Vector6<f64>, p: &Matrix6<f64>) -> Option<SMatrix<f64, STATE_DIM, { 2 * STATE_DIM }>> {
         Cholesky::new(*p).map(|chol| {
@@ -328,6 +328,91 @@ impl RobustCubatureKalmanFilter {
         }
     }
 }
+
+struct MaxCorrentropySRCKF {
+    x: Vector6<f64>,
+    p: Matrix6<f64>,
+    q: Matrix6<f64>,
+    r: Matrix3<f64>,
+    dt: f64,
+    sigma: f64,
+}
+
+impl MaxCorrentropySRCKF {
+    pub fn new(initial_x: Vector6<f64>, initial_p: Matrix6<f64>, q: Matrix6<f64>, r: Matrix3<f64>, dt: f64, sigma: f64) -> Self {
+        Self { x: initial_x, p: initial_p, q, r, dt, sigma }
+    }
+
+    fn generate_cubature_points(&self, x: &Vector6<f64>, p: &Matrix6<f64>) -> Option<SMatrix<f64, STATE_DIM, { 2 * STATE_DIM }>> {
+        Cholesky::new(*p).map(|chol| {
+            let s = chol.l();
+            let mut points = SMatrix::<f64, STATE_DIM, { 2 * STATE_DIM }>::zeros();
+            let factor = (STATE_DIM as f64).sqrt();
+            for i in 0..STATE_DIM {
+                points.set_column(i, &(x + factor * s.column(i)));
+                points.set_column(i + STATE_DIM, &(x - factor * s.column(i)));
+            }
+            points
+        })
+    }
+
+    pub fn predict(&mut self) {
+        if let Some(points) = self.generate_cubature_points(&self.x, &self.p) {
+            let mut propagated_points = SMatrix::<f64, STATE_DIM, { 2 * STATE_DIM }>::zeros();
+            for i in 0..(2 * STATE_DIM) {
+                propagated_points.set_column(i, &state_transition_function(&points.column(i).into(), self.dt));
+            }
+            self.x = propagated_points.column_mean();
+            let mut p_pred = Matrix6::zeros();
+            for i in 0..(2 * STATE_DIM) {
+                let diff = propagated_points.column(i) - self.x;
+                p_pred += diff * diff.transpose();
+            }
+            self.p = p_pred / (2.0 * STATE_DIM as f64) + self.q;
+        }
+    }
+
+    pub fn update(&mut self, z: Vector3<f64>) {
+        if let Some(points) = self.generate_cubature_points(&self.x, &self.p) {
+            let mut observed_points = SMatrix::<f64, OBS_DIM, { 2 * STATE_DIM }>::zeros();
+            for i in 0..(2 * STATE_DIM) {
+                observed_points.set_column(i, &observation_function(&points.column(i).into()));
+            }
+            let z_pred: Vector3<f64> = observed_points.column_mean();
+            
+            let mut p_zz_innovation = Matrix3::zeros();
+            let mut p_xz = SMatrix::<f64, STATE_DIM, OBS_DIM>::zeros();
+            let weight = 1.0 / (2.0 * STATE_DIM as f64);
+            
+            for i in 0..(2 * STATE_DIM) {
+                let z_diff = observed_points.column(i) - z_pred;
+                let x_diff = points.column(i) - self.x;
+                p_zz_innovation += z_diff * z_diff.transpose();
+                p_xz += x_diff * z_diff.transpose();
+            }
+            
+            let p_zz_innovation = weight * p_zz_innovation;
+            let p_xz = weight * p_xz;
+            let innovation = z - z_pred;
+
+            let r_eff = if let Some(p_zz_inv) = (p_zz_innovation + self.r).try_inverse() {
+                let mahalanobis_sq = (innovation.transpose() * p_zz_inv * innovation)[(0, 0)];
+                let correntropy_weight = (-mahalanobis_sq / (2.0 * self.sigma.powi(2))).exp();
+                self.r / (correntropy_weight + 1e-9)
+            } else {
+                self.r
+            };
+
+            let p_zz_eff = p_zz_innovation + r_eff;
+            if let Some(p_zz_eff_inv) = p_zz_eff.try_inverse() {
+                let k = p_xz * p_zz_eff_inv;
+                self.x += k * innovation;
+                self.p -= k * p_zz_eff * k.transpose();
+            }
+        }
+    }
+}
+
 
 struct InteractingMultipleModelFilter {
     x: Vector6<f64>,
@@ -467,6 +552,12 @@ impl KalmanLike for RobustCubatureKalmanFilter {
     fn get_state(&self) -> &Vector6<f64> { &self.x }
     fn get_name(&self) -> &str { "RCKF" }
 }
+impl KalmanLike for MaxCorrentropySRCKF {
+    fn predict(&mut self) { self.predict() }
+    fn update(&mut self, z: Vector3<f64>) { self.update(z) }
+    fn get_state(&self) -> &Vector6<f64> { &self.x }
+    fn get_name(&self) -> &str { "MCSRCKF" }
+}
 impl KalmanLike for InteractingMultipleModelFilter {
     fn predict(&mut self) { self.predict() }
     fn update(&mut self, z: Vector3<f64>) { self.update(z) }
@@ -477,9 +568,9 @@ impl KalmanLike for InteractingMultipleModelFilter {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Simulation Setup ---
     let dt = 0.1;
-    let num_steps = 2000; // ステップ数を2000に変更
+    let num_steps = 4000;
     let output_dir = "frames";
-    let video_filename = "nonlinear_comparison_large.mp4";
+    let video_filename = "nonlinear_comparison_large.mp4"; // ★★★ ここでファイル名が定義されている
     create_dir_all(output_dir)?;
 
     // --- True Path Parameters (Helix) ---
@@ -499,12 +590,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let imm_models = vec![(q_cv, r_mat), (q_maneuver, r_mat)];
     let transition_matrix = SMatrix::<f64, 2, 2>::new(0.95, 0.05, 0.05, 0.95);
+    
+    let mcsrckf_sigma = 5.0;
 
     let mut filters: Vec<Box<dyn KalmanLike>> = vec![
         Box::new(ExtendedKalmanFilter::new(initial_x, initial_p, q_cv, r_mat, dt)),
         Box::new(UnscentedKalmanFilter::new(initial_x, initial_p, q_cv, r_mat, dt)),
         Box::new(CubatureKalmanFilter::new(initial_x, initial_p, q_cv, r_mat, dt)),
         Box::new(RobustCubatureKalmanFilter::new(initial_x, initial_p, q_cv, r_mat, dt)),
+        Box::new(MaxCorrentropySRCKF::new(initial_x, initial_p, q_cv, r_mat, dt, mcsrckf_sigma)),
         Box::new(InteractingMultipleModelFilter::new(initial_x, initial_p, imm_models, transition_matrix, dt)),
     ];
     
@@ -547,11 +641,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // --- Plotting Current Frame ---
-        let frame_path = format!("{}/frame_{:04}.png", output_dir, i); // 2000ステップなので%04に変更
-        let root = BitMapBackend::new(&frame_path, (1920, 1080)).into_drawing_area(); // 解像度を1920x1080に変更
+        let frame_path = format!("{}/frame_{:04}.png", output_dir, i);
+        let root = BitMapBackend::new(&frame_path, (1920, 1080)).into_drawing_area(); // ★★★ ここで解像度が定義されている
         root.fill(&WHITE)?;
         
-        // Z軸の描画範囲をシミュレーションの長さに合わせて調整
         let z_max = vz * (num_steps as f64 * dt) + 50.0;
         let (x_range, y_range, z_range) = ((-60.0..60.0), (-60.0..60.0), (0.0..z_max));
         
@@ -587,17 +680,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         if i > 0 {
             chart.draw_series(LineSeries::new(current_true_path, BLACK.stroke_width(4)))?;
-            let colors = [ORANGE, GREEN, RED, PURPLE, BLUE];
+            let colors = [ORANGE, GREEN, RED, PURPLE, CYAN, BLUE];
             for (j, filter) in filters.iter().enumerate() {
                 chart.draw_series(LineSeries::new(
                     estimates_history[j].iter().map(|s| (s[0], s[2], s[1])),
                     colors[j].stroke_width(2),
                 ))?.label(filter.get_name())
-                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[j].filled()));
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[j].stroke_width(6)));
             }
         }
         
-        chart.configure_series_labels().border_style(BLACK).background_style(WHITE.mix(0.8)).draw()?;
+        chart.configure_series_labels()
+             .border_style(BLACK)
+             .background_style(WHITE.mix(0.8))
+             .label_font(("sans-serif", 25).into_font())
+             .draw()?;
+        
         root.present()?;
         
         print!("\rRendering frame {}/{}...", i + 1, num_steps);
@@ -609,12 +707,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // --- Video Conversion using ffmpeg ---
     println!("Attempting to convert frames to MP4 using ffmpeg...");
-    let ffmpeg_input = format!("{}/frame_%04d.png", output_dir); // %04に変更
+    let ffmpeg_input = format!("{}/frame_%04d.png", output_dir);
+    // ★★★ ffmpegコマンドを修正 ★★★
     let output = Command::new("ffmpeg")
-        .arg("-framerate").arg("60") // フレームレートを60に変更
+        .arg("-framerate").arg("60")
         .arg("-i").arg(&ffmpeg_input)
         .arg("-c:v").arg("libx264")
         .arg("-pix_fmt").arg("yuv420p")
+        .arg("-s").arg("1920x1080") // 解像度ヒントを追加
         .arg("-y").arg(video_filename)
         .output()?;
 
@@ -624,7 +724,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("ffmpeg command failed.");
         eprintln!("ffmpeg stderr: {}", String::from_utf8_lossy(&output.stderr));
         println!("You can try running the command manually:");
-        println!("ffmpeg -framerate 60 -i {} -c:v libx264 -pix_fmt yuv420p {}", ffmpeg_input, video_filename);
+        // 手動実行用のコマンドも修正
+        println!("ffmpeg -framerate 60 -i {} -c:v libx264 -pix_fmt yuv420p -s 1920x1080 {}", ffmpeg_input, video_filename);
     }
 
     Ok(())
