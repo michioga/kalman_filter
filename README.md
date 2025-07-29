@@ -79,13 +79,13 @@ UKFは、$`2n+1`$個の シグマポイント（$n$は状態ベクトルの次�
 1. シグマポイントの生成:
     状態の平均 $`\hat{x}`$ と共分散 $`P`$ から、$`2n+1`$個のシグマポイント $`\mathcal{X}_i`$ と重み $`W_i`$ を計算します。
 
-    $$`
+    $`
     \begin{cases}
     \mathcal{X}_0 = \hat{x} \\
     \mathcal{X}_i = \hat{x} + (\sqrt{(n+\lambda)P})\_i & i=1, \dots, n \\
     \mathcal{X}*i = \hat{x} - (\sqrt{(n+\lambda)P})*{i-n} & i=n+1, \dots, 2n
     \end{cases}
-    `$$
+    `$
 
     ここで $`\lambda`$ はスケーリングパラメータ、$`(\sqrt{\cdot})_i`$ は行列平方根の $`i`$ 番目の列ベクトルです。
 
