@@ -2,7 +2,7 @@
 
 use nalgebra::{Cholesky, Matrix3, Matrix6, SMatrix, Vector3, Vector6};
 use plotters::prelude::*;
-use plotters::prelude::full_palette::{BLUE, CYAN, GREEN, GREY, ORANGE, PURPLE, RED, BLACK, WHITE};
+use plotters::prelude::full_palette::{BLUE, GREEN, GREY, ORANGE,RED, BLACK, WHITE, YELLOW, TEAL};
 use rand::prelude::*;
 use std::f64::consts::PI;
 use std::fs::create_dir_all;
@@ -568,7 +568,7 @@ impl KalmanLike for InteractingMultipleModelFilter {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Simulation Setup ---
     let dt = 0.1;
-    let num_steps = 4000;
+    let num_steps = 5000;
     let output_dir = "frames";
     let video_filename = "nonlinear_comparison_large.mp4"; // ★★★ ここでファイル名が定義されている
     create_dir_all(output_dir)?;
@@ -680,7 +680,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         if i > 0 {
             chart.draw_series(LineSeries::new(current_true_path, BLACK.stroke_width(4)))?;
-            let colors = [ORANGE, GREEN, RED, PURPLE, CYAN, BLUE];
+            let colors = [RED, BLUE, GREEN, YELLOW, ORANGE, TEAL];
             for (j, filter) in filters.iter().enumerate() {
                 chart.draw_series(LineSeries::new(
                     estimates_history[j].iter().map(|s| (s[0], s[2], s[1])),
