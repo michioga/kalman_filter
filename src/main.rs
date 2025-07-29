@@ -570,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt = 0.1;
     let num_steps = 5000;
     let output_dir = "frames";
-    let video_filename = "nonlinear_comparison_large.mp4"; // ★★★ ここでファイル名が定義されている
+    let video_filename = "nonlinear_comparison_large.mp4";
     create_dir_all(output_dir)?;
 
     // --- True Path Parameters (Helix) ---
@@ -605,6 +605,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut true_history: Vec<Vector6<f64>> = Vec::with_capacity(num_steps);
     let mut obs_history_raw: Vec<Vector3<f64>> = Vec::with_capacity(num_steps);
     let mut estimates_history: Vec<Vec<Vector6<f64>>> = vec![Vec::with_capacity(num_steps); filters.len()];
+    let mut error_history: Vec<Vec<f64>> = vec![Vec::with_capacity(num_steps); filters.len()];
     let mut outlier_steps = Vec::new();
     let mut rng = rand::thread_rng();
     
@@ -637,30 +638,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (j, filter) in filters.iter_mut().enumerate() {
             filter.predict();
             filter.update(observation);
-            estimates_history[j].push(filter.get_state().clone());
+            let estimate = filter.get_state().clone();
+            estimates_history[j].push(estimate);
+
+            // 真値と推定値の位置ベクトル間のユークリッド距離を計算
+            let position_error = (current_true_state.xyz() - estimate.xyz()).norm();
+            error_history[j].push(position_error);
         }
 
         // --- Plotting Current Frame ---
         let frame_path = format!("{}/frame_{:04}.png", output_dir, i);
-        let root = BitMapBackend::new(&frame_path, (1920, 1080)).into_drawing_area(); // ★★★ ここで解像度が定義されている
+        let root = BitMapBackend::new(&frame_path, (1920, 1080)).into_drawing_area();
         root.fill(&WHITE)?;
-        
+
+        // ▼▼▼ 修正点 1: タプル分割代入を使用 ▼▼▼
+        // 描画エリアを水平に分割 (左: 3Dプロット, 右: 2D誤差グラフ)
+        let (scene_area, error_area) = root.split_horizontally(1344);
+
+
+        // --- 1. 3Dプロット描画 (左側) ---
+        scene_area.fill(&WHITE)?; // 背景を白で塗りつぶし
         let z_max = vz * (num_steps as f64 * dt) + 50.0;
         let (x_range, y_range, z_range) = ((-60.0..60.0), (-60.0..60.0), (0.0..z_max));
         
-        let mut chart = ChartBuilder::on(&root)
-            .caption(format!("Non-Linear Kalman Filters - Step {}", i + 1), ("sans-serif", 50).into_font())
+        let mut chart3d = ChartBuilder::on(&scene_area)
+            .caption(format!("Non-Linear Kalman Filters - Step {}", i + 1), ("sans-serif", 40).into_font())
             .margin(20)
             .build_cartesian_3d(x_range.clone(), z_range.clone(), y_range.clone())?;
         
-        chart.with_projection(|mut pb| {
+        chart3d.with_projection(|mut pb| {
             pb.pitch = 0.6;
             pb.yaw = 1.9 + (i as f64 / num_steps as f64) * PI / 2.0;
             pb.scale = 0.7;
             pb.into_matrix()
         });
 
-        chart.configure_axes()
+        chart3d.configure_axes()
             .label_style(("sans-serif", 20).into_font())
             .draw()?;
         
@@ -674,15 +687,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (x, z_coord, y)
         });
 
-        chart.draw_series(PointSeries::of_element(current_obs_path, 2, &GREY.mix(0.5), &|c, s, st| {
+        chart3d.draw_series(PointSeries::of_element(current_obs_path, 2, &GREY.mix(0.5), &|c, s, st| {
             EmptyElement::at(c) + Circle::new((0, 0), s, st.filled())
         }))?;
         
         if i > 0 {
-            chart.draw_series(LineSeries::new(current_true_path, BLACK.stroke_width(4)))?;
+            chart3d.draw_series(LineSeries::new(current_true_path, BLACK.stroke_width(4)))?;
             let colors = [RED, BLUE, GREEN, YELLOW, ORANGE, TEAL];
             for (j, filter) in filters.iter().enumerate() {
-                chart.draw_series(LineSeries::new(
+                chart3d.draw_series(LineSeries::new(
                     estimates_history[j].iter().map(|s| (s[0], s[2], s[1])),
                     colors[j].stroke_width(2),
                 ))?.label(filter.get_name())
@@ -690,12 +703,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         
-        chart.configure_series_labels()
+        chart3d.configure_series_labels()
              .border_style(BLACK)
              .background_style(WHITE.mix(0.8))
              .label_font(("sans-serif", 25).into_font())
              .draw()?;
         
+        // --- 2. 2D誤差グラフ描画 (右側) ---
+        error_area.fill(&WHITE.mix(0.95))?;
+
+        // ▼▼▼ 修正点 2: 浮動小数点リテラルの型を明示 ▼▼▼
+        let max_error = 200.0_f64;
+
+        let mut chart2d = ChartBuilder::on(&error_area)
+            .caption("Position RMSE", ("sans-serif", 25).into_font())
+            .margin(10)
+            .x_label_area_size(40)
+            .y_label_area_size(50)
+            .build_cartesian_2d(0..num_steps, 0.0..max_error)?;
+
+        chart2d.configure_mesh()
+            .x_desc("Time Step")
+            .y_desc("Error (meters)")
+            .label_style(("sans-serif", 15))
+            .draw()?;
+
+        let colors = [RED, BLUE, GREEN, YELLOW, ORANGE, TEAL];
+        for (j, filter) in filters.iter().enumerate() {
+            chart2d.draw_series(LineSeries::new(
+                (0..).zip(error_history[j].iter()).map(|(t, e)| (t, *e)),
+                colors[j].stroke_width(2),
+            ))?
+            .label(filter.get_name())
+            .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], colors[j].stroke_width(3)));
+        }
+
+        chart2d.configure_series_labels()
+            .border_style(BLACK)
+            .background_style(WHITE.mix(0.8))
+            .label_font(("sans-serif", 16).into_font())
+            .draw()?;
+
         root.present()?;
         
         print!("\rRendering frame {}/{}...", i + 1, num_steps);
@@ -708,13 +756,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Video Conversion using ffmpeg ---
     println!("Attempting to convert frames to MP4 using ffmpeg...");
     let ffmpeg_input = format!("{}/frame_%04d.png", output_dir);
-    // ★★★ ffmpegコマンドを修正 ★★★
     let output = Command::new("ffmpeg")
         .arg("-framerate").arg("60")
         .arg("-i").arg(&ffmpeg_input)
         .arg("-c:v").arg("libx264")
         .arg("-pix_fmt").arg("yuv420p")
-        .arg("-s").arg("1920x1080") // 解像度ヒントを追加
+        .arg("-s").arg("1920x1080")
         .arg("-y").arg(video_filename)
         .output()?;
 
@@ -724,7 +771,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("ffmpeg command failed.");
         eprintln!("ffmpeg stderr: {}", String::from_utf8_lossy(&output.stderr));
         println!("You can try running the command manually:");
-        // 手動実行用のコマンドも修正
         println!("ffmpeg -framerate 60 -i {} -c:v libx264 -pix_fmt yuv420p -s 1920x1080 {}", ffmpeg_input, video_filename);
     }
 
