@@ -21,8 +21,10 @@
     - $`p_z(t) = ct`$
     このため、フィルタの内部モデルと真の運動の間には常に**モデル化誤差**が存在します。
 
-* **観測方程式 $`z_k = h(x_k) + v_k`$ (非線形)**: 観測は、原点`(0,0,0)`にあるセンサーから得られる**距離(range)**、**方位角(azimuth)**、**仰角(elevation)**です。
+* **観測方程式 $`z_k = h(x_k) + v_k`$ (非線形)**: 観測は、原点`(0,0,0)`にあるセンサーから得られる距離(range)、方位角(azimuth)、仰角(elevation)です。
+
     $`z_k = \begin{bmatrix} r \\ \alpha \\ \epsilon \end{bmatrix} = h(x_k) + v_k = \begin{bmatrix} \sqrt{p_x^2 + p_y^2 + p_z^2} \\ \text{atan2}(p_y, p_x) \\ \text{atan2}(p_z, \sqrt{p_x^2 + p_y^2}) \end{bmatrix} + v_k`$
+
     この観測関数 $`h(\cdot)`$ は強い非線形性を持っています。
 
 ### 各フィルタの役割
@@ -53,4 +55,4 @@
 
 1.  Rust環境と`ffmpeg`を準備します。
 2.  `cargo run --release` を実行します。
-3.  [cite_start]`frames`フォルダに連番画像が、ルートディレクトリに`nonlinear_comparison_large.mp4`が生成されます。 [cite: 3]
+3.  [cite_start]`frames`フォルダに連番画像が、ルートディレクトリに`nonlinear_comparison_large.mp4`が生成されます。
