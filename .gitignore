@@ -2,3 +2,4 @@
 /frames
 *.mp4
 Cargo.lock
+simulation_data.csv
