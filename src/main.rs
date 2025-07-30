@@ -76,7 +76,6 @@ fn observation_function(x_curr: &Vector6<f64>) -> Vector3<f64> {
 }
 
 // --- 各フィルタの実装 ---
-// (注: すべての predict メソッドが dt を引数に取るように修正されています)
 
 struct ExtendedKalmanFilter {
     x: Vector6<f64>,
@@ -568,7 +567,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_simulation(args: &Args) -> Result<(), Box<dyn Error>> {
     // --- Simulation Setup ---
     let dt = 0.1;
-    let num_steps = 1000;
+    let num_steps = 2000;
     let output_dir = "frames";
 
     // --- True Path Parameters (Helix) ---
@@ -689,6 +688,25 @@ fn run_simulation(args: &Args) -> Result<(), Box<dyn Error>> {
         stdout().flush()?;
     }
 
+    println!("\n\n--- Simulation Finished ---");
+
+    // --- Calculate and Plot Final RMSE ---
+    let mut rmse_results: Vec<(String, f64)> = Vec::new();
+    for (j, filter) in filters.iter().enumerate() {
+        let error_vec = &error_history[j];
+        if !error_vec.is_empty() {
+            let mse: f64 = error_vec.iter().map(|e| e.powi(2)).sum::<f64>() / error_vec.len() as f64;
+            let rmse = mse.sqrt();
+            rmse_results.push((filter.get_name().to_string(), rmse));
+        }
+    }
+
+    // Sort by RMSE value for better visualization
+    rmse_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    create_rmse_summary_chart(&rmse_results, "rmse_summary.png")?;
+
+
     create_video(&args, output_dir)?;
     Ok(())
 }
@@ -784,6 +802,77 @@ fn run_from_csv(csv_path: &PathBuf, args: &Args) -> Result<(), Box<dyn Error>> {
     }
     
     create_video(&args, output_dir)?;
+    Ok(())
+}
+
+/// 最終的なRMSEのサマリーグラフ（バーチャート）を生成する
+fn create_rmse_summary_chart(
+    results: &Vec<(String, f64)>,
+    output_path: &str,
+) -> Result<(), Box<dyn Error>> {
+    let root = BitMapBackend::new(output_path, (1280, 720)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let max_rmse = results.iter().map(|(_, rmse)| *rmse).fold(0.0, f64::max);
+    let filter_names: Vec<String> = results.iter().map(|(name, _)| name.clone()).collect();
+    let num_filters = filter_names.len();
+
+    let mut chart = ChartBuilder::on(&root)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .margin(20)
+        .caption("Final Position RMSE by Filter", ("sans-serif", 40))
+        // --- 修正箇所: カテゴリカル軸を単純な数値軸に変更 ---
+        .build_cartesian_2d(
+            0..num_filters, // X軸は 0 から (フィルタ数-1) までの範囲
+            0.0..(max_rmse * 1.15),
+        )?;
+
+    chart
+        .configure_mesh()
+        .disable_x_mesh()
+        .bold_line_style(GREY.mix(0.2))
+        .y_desc("Position RMSE (meters)")
+        .x_desc("Filter Type")
+        .axis_desc_style(("sans-serif", 20))
+        // --- 修正箇所: X軸のラベルをフォーマッタで手動設定 ---
+        .x_label_formatter(&|x| {
+            if *x < num_filters {
+                filter_names[*x].clone()
+            } else {
+                "".to_string()
+            }
+        })
+        .draw()?;
+
+    // --- 修正箇所: X座標に数値(index)を使用してバーを描画 ---
+    chart.draw_series(
+        results.iter().enumerate().map(|(index, (_name, rmse))| {
+            let color = &Palette99::pick(index);
+            // Histogram::vertical は非推奨なので、Rectangleで描画
+            let mut bar = Rectangle::new(
+                [(index, 0.0), (index, *rmse)],
+                color.filled(),
+            );
+            // バーの幅を調整
+            bar.set_margin(0, 0, 5, 5);
+            bar
+        })
+    )?;
+
+    // --- 修正箇所: X座標に数値(index)を使用してラベルを描画 ---
+    chart.draw_series(
+        results.iter().enumerate().map(|(index, (_name, rmse))| {
+            Text::new(
+                format!("{:.2}", rmse),
+                (index, *rmse + max_rmse * 0.02),
+                ("sans-serif", 18).into_font(),
+            )
+        })
+    )?;
+
+    root.present()?;
+    println!("\nRMSE summary chart saved to {}", output_path);
     Ok(())
 }
 
